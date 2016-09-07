@@ -91,6 +91,7 @@ command(s) that get executed on start, edit the args parameter of the spec. See
 			if ns.Path != "" {
 				if strings.Contains(ns.Path, "/") {
 					fmt.Printf("Runv doesn't support path to namespace file, it supports containers name as shared namespaces only\n")
+					fmt.Printf("Offending namespace was: %s %s\n", ns.Type, ns.Path)
 					os.Exit(-1)
 				}
 				if ns.Type == "mount" {

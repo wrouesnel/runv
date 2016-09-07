@@ -143,7 +143,7 @@ func (sv *Supervisor) getHyperPod(container string, spec *specs.Spec) (hp *Hyper
 	for _, ns := range spec.Linux.Namespaces {
 		if ns.Path != "" {
 			if strings.Contains(ns.Path, "/") {
-				return nil, fmt.Errorf("Runv doesn't support path to namespace file, it supports containers name as shared namespaces only")
+				return nil, fmt.Errorf("Runv doesn't support path to namespace file, it supports containers name as shared namespaces only. Offending namespace was: %s %s\n", ns.Type, ns.Path)
 			}
 			if ns.Type == "mount" {
 				// TODO support it!
