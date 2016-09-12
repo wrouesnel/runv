@@ -16,6 +16,7 @@ import (
 	"github.com/kardianos/osext"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/vishvananda/netlink"
+	"io"
 )
 
 type NetlinkUpdateType string
@@ -209,6 +210,10 @@ func (hp *HyperPod) nsListenerStrap() {
 		update := NetlinkUpdate{}
 		err := listener.dec.Decode(&update)
 		if err != nil {
+			if err == io.EOF {
+				glog.Info("listener.dec.Decode NetlinkUpdate:", err)
+				break
+			}
 			glog.Error("listener.dec.Decode NetlinkUpdate error:", err)
 			continue
 		}
