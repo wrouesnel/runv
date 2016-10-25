@@ -13,6 +13,8 @@ import (
 //change first letter to uppercase and add json tag (thanks GNU sed):
 //  gsed -ie 's/^    \([a-z]\)\([a-zA-Z]*\)\( \{1,\}[^ ]\{1,\}.*\)$/    \U\1\E\2\3 `json:"\1\2"`/' pod.go
 
+// TODO: audit this module and hide the concurrent data
+
 type HandleEvent struct {
 	Handle func(*types.VmResponse, interface{}, *PodStatus, *Vm) bool
 	Data   interface{}
@@ -32,6 +34,9 @@ type PodStatus struct {
 	Handler       *HandleEvent
 	StartedAt     string
 	FinishedAt    string
+
+	execLock       sync.RWMutex
+	containersLock sync.Mutex
 }
 
 type ContainerStatus struct {
@@ -68,6 +73,8 @@ type PreparingItem interface {
 }
 
 func (mypod *PodStatus) SetPodContainerStatus(data []uint32) {
+	mypod.containersLock.Lock()
+	defer mypod.containersLock.Unlock()
 	failure := 0
 	for i, c := range mypod.Containers {
 		if data[i] != 0 {
@@ -87,12 +94,16 @@ func (mypod *PodStatus) SetPodContainerStatus(data []uint32) {
 }
 
 func (mypod *PodStatus) SetContainerStatus(status uint32) {
+	mypod.containersLock.Lock()
+	defer mypod.containersLock.Unlock()
 	for _, c := range mypod.Containers {
 		c.Status = status
 	}
 }
 
 func (mypod *PodStatus) SetOneContainerStatus(containerId string, code uint8) {
+	mypod.containersLock.Lock()
+	defer mypod.containersLock.Unlock()
 	for _, c := range mypod.Containers {
 		if c.Id == containerId {
 			c.ExitCode = code
@@ -107,6 +118,8 @@ func (mypod *PodStatus) SetOneContainerStatus(containerId string, code uint8) {
 }
 
 func (mypod *PodStatus) AddContainer(containerId, name, image string, cmds []string, status uint32) {
+	mypod.containersLock.Lock()
+	defer mypod.containersLock.Unlock()
 	container := &ContainerStatus{
 		Id:     containerId,
 		Name:   name,
@@ -120,6 +133,8 @@ func (mypod *PodStatus) AddContainer(containerId, name, image string, cmds []str
 }
 
 func (mypod *PodStatus) GetContainer(containerId string) *ContainerStatus {
+	mypod.containersLock.Lock()
+	defer mypod.containersLock.Unlock()
 	for _, c := range mypod.Containers {
 		if c.Id == containerId {
 			return c
@@ -130,6 +145,8 @@ func (mypod *PodStatus) GetContainer(containerId string) *ContainerStatus {
 }
 
 func (mypod *PodStatus) DeleteContainer(containerId string) {
+	mypod.containersLock.Lock()
+	defer mypod.containersLock.Unlock()
 	for i, c := range mypod.Containers {
 		if c.Id == containerId {
 			mypod.Containers = append(mypod.Containers[:i], mypod.Containers[i+1:]...)
@@ -139,6 +156,8 @@ func (mypod *PodStatus) DeleteContainer(containerId string) {
 }
 
 func (mypod *PodStatus) SetExecStatus(execId string, code uint8) {
+	mypod.execLock.RLock()
+	defer mypod.execLock.RUnlock()
 	exec, ok := mypod.Execs[execId]
 	if ok {
 		exec.ExitCode = code
@@ -146,6 +165,8 @@ func (mypod *PodStatus) SetExecStatus(execId string, code uint8) {
 }
 
 func (mypod *PodStatus) AddExec(containerId, execId, cmds string, terminal bool) {
+	mypod.execLock.Lock()
+	defer mypod.execLock.Unlock()
 	mypod.Execs[execId] = &ExecStatus{
 		Container: containerId,
 		Id:        execId,
@@ -156,14 +177,20 @@ func (mypod *PodStatus) AddExec(containerId, execId, cmds string, terminal bool)
 }
 
 func (mypod *PodStatus) DeleteExec(execId string) {
+	mypod.execLock.Lock()
+	defer mypod.execLock.Unlock()
 	delete(mypod.Execs, execId)
 }
 
 func (mypod *PodStatus) CleanupExec() {
+	mypod.execLock.Lock()
+	defer mypod.execLock.Unlock()
 	mypod.Execs = make(map[string]*ExecStatus)
 }
 
 func (mypod *PodStatus) GetExec(execId string) *ExecStatus {
+	mypod.execLock.RLock()
+	defer mypod.execLock.RUnlock()
 	if exec, ok := mypod.Execs[execId]; ok {
 		return exec
 	}
