@@ -1,5 +1,7 @@
 package json
 
+import "fmt"
+
 // when APIVERSION < 1000000, the version MUST be exactly matched on both sides
 const VERSION = 4243
 
@@ -30,3 +32,41 @@ const (
 	INIT_PROCESSASYNCEVENT
 	INIT_SIGNALPROCESS
 )
+
+// Convenient lookup table for converting code numbers to text
+var codeTable map[uint32]string = map[uint32]string{
+	INIT_VERSION:                     "INIT_VERSION",
+	INIT_STARTPOD:                    "INIT_STARTPOD",
+	INIT_GETPOD_DEPRECATED:           "INIT_GETPOD_DEPRECATED",
+	INIT_STOPPOD_DEPRECATED:          "INIT_STOPPOD_DEPRECATED",
+	INIT_DESTROYPOD:                  "INIT_DESTROYPOD",
+	INIT_RESTARTCONTAINER_DEPRECATED: "INIT_RESTARTCONTAINER_DEPRECATED",
+	INIT_EXECCMD:                     "INIT_EXECCMD",
+	INIT_FINISHCMD_DEPRECATED:        "INIT_FINISHCMD_DEPRECATED",
+	INIT_READY:                       "INIT_READY",
+	INIT_ACK:                         "INIT_ACK",
+	INIT_ERROR:                       "INIT_ERROR",
+	INIT_WINSIZE:                     "INIT_WINSIZE",
+	INIT_PING:                        "INIT_PING",
+	INIT_FINISHPOD_DEPRECATED:        "INIT_FINISHPOD_DEPRECATED",
+	INIT_NEXT:                        "INIT_NEXT",
+	INIT_WRITEFILE:                   "INIT_WRITEFILE",
+	INIT_READFILE:                    "INIT_READFILE",
+	INIT_NEWCONTAINER:                "INIT_NEWCONTAINER",
+	INIT_KILLCONTAINER:               "INIT_KILLCONTAINER",
+	INIT_ONLINECPUMEM:                "INIT_ONLINECPUMEM",
+	INIT_SETUPINTERFACE:              "INIT_SETUPINTERFACE",
+	INIT_SETUPROUTE:                  "INIT_SETUPROUTE",
+	INIT_REMOVECONTAINER:             "INIT_REMOVECONTAINER",
+	INIT_PROCESSASYNCEVENT:           "INIT_PROCESSASYNCEVENT",
+	INIT_SIGNALPROCESS:               "INIT_SIGNALPROCESS",
+}
+
+// This public function protects the map above from accidental modification
+func CmdAsString(code uint32) string {
+	name, ok := codeTable[code]
+	if !ok {
+		return fmt.Sprintf("UNKNOWN (%v)", code)
+	}
+	return name
+}
