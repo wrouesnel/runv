@@ -8,9 +8,12 @@ import (
 	"sync"
 	"time"
 
+	"encoding/json"
 	"github.com/golang/glog"
 	"github.com/hyperhq/runv/factory"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"io/ioutil"
+	"path/filepath"
 )
 
 type Supervisor struct {
@@ -46,8 +49,71 @@ func New(stateDir, eventLogDir string, f factory.Factory, defaultCpus int, defau
 		defaultMemory: defaultMemory,
 		Containers:    make(map[string]*Container),
 	}
+
+	dirEntries, err := ioutil.ReadDir(stateDir)
+	if err != nil {
+		return nil, fmt.Errorf("could not open stateDir: %v %v", stateDir, err)
+	}
+
+	// Reload stale containers which still have configuration. These will be
+	// marked as "stopped". This allows recovery and clean up after an
+	// unexpected shutdown.
+	for _, e := range dirEntries {
+		if !e.IsDir() {
+			continue
+		}
+		stateFile := filepath.Join(stateDir, e.Name(), "state.json")
+		if _, err := os.Stat(stateFile); os.IsNotExist(err) {
+			glog.Warningf("stateDir exists but state.json does not: %v", e.Name())
+			continue
+		}
+
+		data, err := ioutil.ReadFile(stateFile)
+		if err != nil {
+			glog.Errorf("error reading stateFile: %v %v", stateFile, err)
+			continue
+		}
+
+		state := &specs.State{}
+		if err := json.Unmarshal(data, &state); err != nil {
+			glog.Errorf("error unmarshalling stateFile: %v %v", stateFile, err)
+			continue
+		}
+
+		// TODO: it's not clear we can always recover specs this way? Should
+		// they be saved somewhere else?
+		spec := new(specs.Spec)
+		ocfData, err := ioutil.ReadFile(filepath.Join(state.BundlePath, "config.json"))
+		if err != nil {
+			glog.Errorf("could not read config.json from container BundlePath: %v", err)
+			// TODO: should a missing file lead to cleaning up runv-containerd state?
+			continue
+		}
+		if err := json.Unmarshal(ocfData, spec); err != nil {
+			glog.Errorf("could not unmarshal config.json from container BundlePath: %v", err)
+			continue
+		}
+
+		// State is loaded. Add a stopped container (no owner pod).
+		// TODO: it should be possible to read the pid from state.json and
+		// find a running VM that the container might still be active in and
+		// reconnect to it.
+		sv.Containers[state.ID] = &Container{
+			Id:         state.ID,
+			BundlePath: state.BundlePath,
+			Spec:       spec,
+			Processes:  make(map[string]*Process),
+			ownerPod:   nil,
+		}
+		glog.Infof("Recovered stopped container for supervisor: %v", state.ID)
+	}
+
 	sv.Events.subscribers = make(map[chan Event]struct{})
 	go sv.reaper()
+
+	// TODO: read stateDir and setup pod-less containers so we can recover
+	// mountpoints on a hard kill.
+
 	return sv, sv.Events.setupEventLog(eventLogDir)
 }
 
