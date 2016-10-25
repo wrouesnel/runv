@@ -1,5 +1,7 @@
 package json
 
+import "fmt"
+
 const VERSION = 4242
 
 const (
@@ -26,3 +28,38 @@ const (
 	INIT_SETUPINTERFACE
 	INIT_SETUPROUTE
 )
+
+// Convenient lookup table for converting code numbers to text
+var codeTable map[uint32]string = map[uint32]string{
+	INIT_VERSION:            "INIT_VERSION",
+	INIT_STARTPOD:           "INIT_STARTPOD",
+	INIT_GETPOD:             "INIT_GETPOD",
+	INIT_STOPPOD_DEPRECATED: "INIT_STOPPOD_DEPRECATED",
+	INIT_DESTROYPOD:         "INIT_DESTROYPOD",
+	INIT_RESTARTCONTAINER:   "INIT_RESTARTCONTAINER",
+	INIT_EXECCMD:            "INIT_EXECCMD",
+	INIT_FINISHCMD:          "INIT_FINISHCMD",
+	INIT_READY:              "INIT_READY",
+	INIT_ACK:                "INIT_ACK",
+	INIT_ERROR:              "INIT_ERROR",
+	INIT_WINSIZE:            "INIT_WINSIZE",
+	INIT_PING:               "INIT_PING",
+	INIT_FINISHPOD:          "INIT_FINISHPOD",
+	INIT_NEXT:               "INIT_NEXT",
+	INIT_WRITEFILE:          "INIT_WRITEFILE",
+	INIT_READFILE:           "INIT_READFILE",
+	INIT_NEWCONTAINER:       "INIT_NEWCONTAINER",
+	INIT_KILLCONTAINER:      "INIT_KILLCONTAINER",
+	INIT_ONLINECPUMEM:       "INIT_ONLINECPUMEM",
+	INIT_SETUPINTERFACE:     "INIT_SETUPINTERFACE",
+	INIT_SETUPROUTE:         "INIT_SETUPROUTE",
+}
+
+// This public function protects the map above from accidental modification
+func CmdAsString(code uint32) string {
+	name, ok := codeTable[code]
+	if !ok {
+		return fmt.Sprintf("UNKNOWN (%v)", code)
+	}
+	return name
+}

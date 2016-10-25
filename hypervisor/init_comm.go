@@ -222,7 +222,7 @@ func waitCmdToInit(ctx *VmContext, init *net.UnixConn) {
 		if cmd.result == nil {
 			cmd.result = defaultHyperstartResultChan(ctx, cmd)
 		}
-		glog.Infof("got cmd:%d", cmd.Code)
+		glog.Infof("got cmd: %s", hyperstartapi.CmdAsString(cmd.Code))
 		if cmd.Code == hyperstartapi.INIT_ACK || cmd.Code == hyperstartapi.INIT_ERROR {
 			if len(cmds) > 0 {
 				if cmds[0].Code == hyperstartapi.INIT_DESTROYPOD {
