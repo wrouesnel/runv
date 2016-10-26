@@ -30,9 +30,16 @@ type Container struct {
 	ownerPod *HyperPod
 }
 
-func (c *Container) run(p *Process) {
+func (c *Container) run(p *Process) error {
+	// Receives the early result of the attempt to start the container,
+	// which ensures that we do not return before EventContainerStart
+	// is emitted.
+	resultCh := make(chan error)
+
 	go func() {
 		err := c.start(p)
+		resultCh <- err
+		close(resultCh)
 		if err != nil {
 			c.ownerPod.sv.reap(c.Id, p.Id)
 			return
@@ -59,6 +66,9 @@ func (c *Container) run(p *Process) {
 		}
 		c.ownerPod.sv.Events.notifySubscribers(e)
 	}()
+
+	err := <-resultCh
+	return err
 }
 
 func (c *Container) start(p *Process) error {
@@ -226,22 +236,32 @@ func (c *Container) addProcess(processId, stdin, stdout, stderr string, spec *sp
 	c.ownerPod.Processes[processId] = p
 	c.Processes[processId] = p
 
-	e := Event{
-		ID:        c.Id,
-		Type:      EventProcessStart,
-		Timestamp: time.Now(),
-		PID:       processId,
-	}
-	c.ownerPod.sv.Events.notifySubscribers(e)
+	// Wait for the VM to acknowledge the process has attached to avoid a
+	// libcontainer deadlock.
+	resultCh := make(chan error)
 
 	go func() {
 		c.ownerPod.podStatus.AddExec(c.Id, processId, "", spec.Terminal)
 		err := c.ownerPod.vm.AddProcess(c.Id, processId, spec.Terminal, spec.Args, spec.Env, spec.Cwd, p.stdio)
+		resultCh <- err
+		close(resultCh)
 		if err != nil {
 			glog.V(1).Infof("add process to container failed: %v\n", err)
-		} else {
-			err = p.stdio.WaitForFinish()
+			return
 		}
+
+		// Notify listeners that we did successfully start a process
+		c.ownerPod.sv.Events.notifySubscribers(
+			Event{
+				ID:        c.Id,
+				Type:      EventProcessStart,
+				Timestamp: time.Now(),
+				PID:       processId,
+			},
+		)
+
+		// Wait for the process to exit
+		err = p.stdio.WaitForFinish()
 
 		e := Event{
 			ID:        c.Id,
@@ -250,6 +270,7 @@ func (c *Container) addProcess(processId, stdin, stdout, stderr string, spec *sp
 			PID:       processId,
 			Status:    -1,
 		}
+
 		if err != nil {
 			glog.V(1).Infof("get exit code failed %s\n", err.Error())
 		} else {
@@ -259,6 +280,12 @@ func (c *Container) addProcess(processId, stdin, stdout, stderr string, spec *sp
 		}
 		c.ownerPod.sv.Events.notifySubscribers(e)
 	}()
+
+	err = <-resultCh
+	if err != nil {
+		return nil, err
+	}
+
 	return p, nil
 }
 
