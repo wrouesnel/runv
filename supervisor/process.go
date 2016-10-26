@@ -22,22 +22,25 @@ type Process struct {
 
 	// inerId is Id or container id + "-init"
 	// pass to hypervisor package and HyperPod.Processes
-	inerId      string
-	ownerCont   *Container
-	init        bool
-	stdio       *hypervisor.TtyIO
-	stdinCloser io.Closer
+	inerId        string
+	ownerCont     *Container
+	init          bool
+	stdio         *hypervisor.TtyIO
+	stdinCloserCh <-chan io.Closer // Prevent deadlock when stdin is a fifo
 }
 
 func (p *Process) setupIO() error {
 	glog.Infof("process setupIO: stdin %s, stdout %s, stderr %s", p.Stdin, p.Stdout, p.Stderr)
 
 	// use a new go routine to avoid deadlock when stdin is fifo
+	stdinCloserCh := make(chan io.Closer, 1)
 	go func() {
 		if stdinCloser, err := os.OpenFile(p.Stdin, syscall.O_WRONLY, 0); err == nil {
-			p.stdinCloser = stdinCloser
+			stdinCloserCh <- stdinCloser
 		}
+		close(stdinCloserCh)
 	}()
+	p.stdinCloserCh = stdinCloserCh
 
 	stdin, err := os.OpenFile(p.Stdin, syscall.O_RDONLY, 0)
 	if err != nil {
@@ -73,9 +76,11 @@ func (p *Process) ttyResize(container string, width, height int) error {
 
 func (p *Process) closeStdin() error {
 	var err error
-	if p.stdinCloser != nil {
-		err = p.stdinCloser.Close()
-		p.stdinCloser = nil
+	if p.stdinCloserCh != nil {
+		if stdinCloser := <-p.stdinCloserCh; stdinCloser != nil {
+			err = stdinCloser.Close()
+		}
+		p.stdinCloserCh = nil
 	}
 	return err
 }
