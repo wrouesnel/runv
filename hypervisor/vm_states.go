@@ -67,8 +67,8 @@ func (ctx *VmContext) prepareDevice(cmd *RunPodCommand) bool {
 		glog.Info("initial vm spec: ", string(res))
 	}
 
-	pendings := ctx.ptys.pendingTtys
-	ctx.ptys.pendingTtys = []*AttachCommand{}
+	// Grab the entire pending queue
+	pendings := ctx.ptys.pendingTtys.Swap([]*AttachCommand{})
 	for _, acmd := range pendings {
 		idx := ctx.Lookup(acmd.Container)
 		if idx >= 0 {
@@ -76,7 +76,7 @@ func (ctx *VmContext) prepareDevice(cmd *RunPodCommand) bool {
 			ctx.attachTty2Container(&ctx.vmSpec.Containers[idx].Process, acmd)
 		} else {
 			glog.Infof("not attach for %s", acmd.Container)
-			ctx.ptys.pendingTtys = append(ctx.ptys.pendingTtys, acmd)
+			ctx.ptys.pendingTtys.Append(acmd)
 		}
 	}
 
@@ -107,15 +107,14 @@ func (ctx *VmContext) prepareContainer(cmd *NewContainerCommand) *hyperstartapi.
 
 	ctx.lock.Unlock()
 
-	pendings := ctx.ptys.pendingTtys
-	ctx.ptys.pendingTtys = []*AttachCommand{}
+	pendings := ctx.ptys.pendingTtys.Swap([]*AttachCommand{})
 	for _, acmd := range pendings {
 		if idx == ctx.Lookup(acmd.Container) {
 			glog.Infof("attach pending client for %s", acmd.Container)
 			ctx.attachTty2Container(&ctx.vmSpec.Containers[idx].Process, acmd)
 		} else {
 			glog.Infof("not attach for %s", acmd.Container)
-			ctx.ptys.pendingTtys = append(ctx.ptys.pendingTtys, acmd)
+			ctx.ptys.pendingTtys.Append(acmd)
 		}
 	}
 
@@ -174,7 +173,7 @@ func (ctx *VmContext) setWindowSize(containerId, execId string, size *WindowSize
 		return
 	}
 
-	if !ctx.ptys.isTty(session) {
+	if !ctx.ptys.IsTty(session) {
 		glog.Error("the session is not a tty, doesn't support resize.")
 		return
 	}
@@ -198,9 +197,9 @@ func (ctx *VmContext) onlineCpuMem(cmd *OnlineCpuMemCommand) {
 }
 
 func (ctx *VmContext) execCmd(execId string, cmd *hyperstartapi.ExecCommand, tty *TtyIO, result chan<- error) {
-	cmd.Process.Stdio = ctx.ptys.nextAttachId()
+	cmd.Process.Stdio = ctx.ptys.NextAttachId()
 	if !cmd.Process.Terminal {
-		cmd.Process.Stderr = ctx.ptys.nextAttachId()
+		cmd.Process.Stderr = ctx.ptys.NextAttachId()
 	}
 	ctx.lock.Lock()
 	ctx.vmExec[execId] = cmd
@@ -227,7 +226,7 @@ func (ctx *VmContext) killCmd(container string, signal syscall.Signal, result ch
 func (ctx *VmContext) attachCmd(cmd *AttachCommand, result chan<- error) {
 	idx := ctx.Lookup(cmd.Container)
 	if cmd.Container != "" && idx < 0 {
-		ctx.ptys.pendingTtys = append(ctx.ptys.pendingTtys, cmd)
+		ctx.ptys.pendingTtys.Append(cmd)
 		glog.V(1).Infof("attachment %s is pending", cmd.Container)
 		result <- nil
 		return

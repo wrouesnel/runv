@@ -92,14 +92,14 @@ func (ctx *VmContext) dumpHwInfo() *VmHwStatus {
 	return &VmHwStatus{
 		PciAddr:  ctx.pciAddr,
 		ScsiId:   ctx.scsiId,
-		AttachId: ctx.ptys.attachId,
+		AttachId: ctx.ptys.CurrentAttachId(),
 	}
 }
 
 func (ctx *VmContext) loadHwStatus(pinfo *PersistInfo) {
 	ctx.pciAddr = pinfo.HwStat.PciAddr
 	ctx.scsiId = pinfo.HwStat.ScsiId
-	ctx.ptys.attachId = pinfo.HwStat.AttachId
+	ctx.ptys.SetAttachId(pinfo.HwStat.AttachId)
 }
 
 func (blk *BlockDescriptor) dump() *PersistVolumeInfo {
