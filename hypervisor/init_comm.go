@@ -252,9 +252,11 @@ func waitCmdToInit(ctx *VmContext, init *net.UnixConn) {
 						ctx.vm <- &hyperstartCmd{
 							Code: hyperstartapi.INIT_PING,
 						}
-						pingTimer = nil
 					})
 				} else {
+					if !pingTimer.Stop() {
+						<-pingTimer.C
+					}
 					pingTimer.Reset(30 * time.Second)
 				}
 			} else {
