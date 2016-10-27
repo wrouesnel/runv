@@ -211,7 +211,7 @@ func (ctx *VmContext) LookupBySession(session uint64) string {
 			return c.Id
 		}
 	}
-	glog.V(1).Infof("can not found container whose session is %s", session)
+	glog.V(1).Infof("can not found container whose session is %v", session)
 	return ""
 }
 
