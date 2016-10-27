@@ -84,7 +84,9 @@ func (se *SvEvents) readEventLog(logDir string) error {
 			}
 			return err
 		}
+		se.eventLock.Lock()
 		se.eventLog = append(se.eventLog, e)
+		se.eventLock.Unlock()
 	}
 	return nil
 }
@@ -98,7 +100,7 @@ func (se *SvEvents) Events(from time.Time, storedOnly bool, id string) chan Even
 		defer se.Unsubscribe(c)
 	}
 
-	// Do not allow the subscriber to unsubscript
+	// Do not allow the subscriber to unsubscribe before we finish updating them
 	se.subscriberLock.Lock()
 	defer se.subscriberLock.Unlock()
 
