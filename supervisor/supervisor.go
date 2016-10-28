@@ -20,7 +20,7 @@ type Supervisor struct {
 	defaultCpus   int
 	defaultMemory int
 
-	Events SvEvents
+	Events *SvEvents
 
 	sync.RWMutex // Protects Supervisor.Containers, HyperPod.Containers, HyperPod.Processes, Container.Processes
 	Containers   map[string]*Container
@@ -46,7 +46,7 @@ func New(stateDir, eventLogDir string, f factory.Factory, defaultCpus int, defau
 		defaultMemory: defaultMemory,
 		Containers:    make(map[string]*Container),
 	}
-	sv.Events.subscribers = make(map[chan Event]struct{})
+	sv.Events = NewSvEvents()
 	go sv.reaper()
 	return sv, sv.Events.setupEventLog(eventLogDir)
 }

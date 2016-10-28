@@ -29,16 +29,32 @@ type Event struct {
 	Status    int       `json:"status,omitempty"`
 }
 
-// TODO: copied code, including two bugs
-// eventLog is not protected
-// Events() might be deadlocked
+// Represents a subscriber and acts a mini-queue for subscribers which are
+// catching up.
+type svEventSubscriber struct {
+	// Holds events which occurred while the subscriber is catching up.
+	localEventLog []Event
+	storedOnly    bool             // Subscriber does not receive new events at the moment.
+	closing       chan interface{} // If subscriber has closed, this channel is closed
+	// Protects the eventSubscriber.
+	*sync.Mutex
+}
 
 type SvEvents struct {
 	subscriberLock sync.RWMutex
-	subscribers    map[chan Event]struct{}
+	// Subscribers need 2 channels - one is the channel we emit events to them
+	// on, the other is used to notify internal routines if the subscriber
+	// unsubscribes early.
+	subscribers map[chan Event]svEventSubscriber
 
 	eventLog  []Event
 	eventLock sync.Mutex
+}
+
+func NewSvEvents() *SvEvents {
+	return &SvEvents{
+		subscribers: make(map[chan Event]svEventSubscriber),
+	}
 }
 
 func (se *SvEvents) setupEventLog(logDir string) error {
@@ -94,41 +110,67 @@ func (se *SvEvents) readEventLog(logDir string) error {
 // Events returns an event channel that external consumers can use to receive updates
 // on container events
 func (se *SvEvents) Events(from time.Time, storedOnly bool, id string) chan Event {
+	// Make event channel
 	c := make(chan Event, defaultEventsBufferSize)
-
-	if storedOnly {
-		defer se.Unsubscribe(c)
+	// Make the channel available as a subscriber
+	subscriber := svEventSubscriber{
+		localEventLog: []Event{},
+		storedOnly:    storedOnly,
+		closing:       make(chan interface{}),
+		Mutex:         new(sync.Mutex),
 	}
 
-	// Do not allow the subscriber to unsubscribe before we finish updating them
 	se.subscriberLock.Lock()
-	defer se.subscriberLock.Unlock()
+	se.subscribers[c] = subscriber
+	se.subscriberLock.Unlock()
 
 	if !from.IsZero() {
-		// replay old event
-		// note: we lock and make a copy of history to avoid blocking
+		// snapshot history at this point in time.
 		se.eventLock.Lock()
-		past := se.eventLog[:]
+		subscriber.Lock()
+		subscriber.localEventLog = se.eventLog[:]
+		subscriber.Unlock()
 		se.eventLock.Unlock()
 
-		for _, e := range past {
-			if e.Timestamp.After(from) {
-				if id == "" || e.ID == id {
-					c <- e
+		// Start dequeuing events from history
+		go func() {
+			for {
+				subscriber.Lock()
+				if len(subscriber.localEventLog) == 0 {
+					if storedOnly {
+						// Close the channel and finish.
+						se.Unsubscribe(c)
+					} else {
+						// Lock the subscriber, send the live event notification.
+						subscriber.Lock()
+						subscriber.storedOnly = false
+						// Notify the client that from now on it's live events
+						c <- Event{
+							Type:      "live",
+							Timestamp: time.Now(),
+						}
+					}
+					subscriber.Unlock()
+					break
 				}
-			}
-		}
+				// Dequeue an item
+				e := subscriber.localEventLog[0]
+				subscriber.localEventLog = subscriber.localEventLog[1:]
 
-		if storedOnly {
-			close(c)
-		} else {
-			// Notify the client that from now on it's live events
-			c <- Event{
-				Type:      "live",
-				Timestamp: time.Now(),
+				if e.Timestamp.After(from) {
+					if id == "" || e.ID == id {
+						select {
+						case _ = <-subscriber.closing:
+							// Subscriber exited early
+							return
+						default:
+							c <- e
+						}
+					}
+				}
+				subscriber.Unlock()
 			}
-			se.subscribers[c] = struct{}{}
-		}
+		}()
 	}
 	return c
 }
@@ -137,9 +179,10 @@ func (se *SvEvents) Events(from time.Time, storedOnly bool, id string) chan Even
 func (se *SvEvents) Unsubscribe(sub chan Event) {
 	se.subscriberLock.Lock()
 	defer se.subscriberLock.Unlock()
-	if _, ok := se.subscribers[sub]; ok {
+	if subinfo, ok := se.subscribers[sub]; ok {
 		delete(se.subscribers, sub)
 		close(sub)
+		close(subinfo.closing)
 	}
 }
 
@@ -149,12 +192,20 @@ func (se *SvEvents) notifySubscribers(e Event) {
 	glog.Infof("notifySubscribers: %v", e)
 	se.subscriberLock.RLock()
 	defer se.subscriberLock.RUnlock()
-	for sub := range se.subscribers {
-		// do a non-blocking send for the channel
-		select {
-		case sub <- e:
-		default:
-			glog.Warningf("containerd: event not sent to subscriber")
+	for c := range se.subscribers {
+		sub := se.subscribers[c]
+		sub.Lock()
+		if sub.storedOnly {
+			// Queue while sub empties
+			sub.localEventLog = append(sub.localEventLog, e)
+		} else {
+			// do a non-blocking send for the channel
+			select {
+			case c <- e:
+			default:
+				glog.Warningf("containerd: event not sent to subscriber")
+			}
 		}
+		sub.Unlock()
 	}
 }
