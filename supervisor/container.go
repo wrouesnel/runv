@@ -45,7 +45,16 @@ func (c *Container) run(p *Process) error {
 			return
 		}
 
+		glog.V(3).Infof("start container")
 		err = c.start(p)
+
+		glog.V(3).Infof("send container start success")
+		resultCh <- err
+		close(resultCh)
+		if err != nil {
+			return
+		}
+
 		e := Event{
 			ID:        c.Id,
 			Type:      EventContainerStart,
@@ -53,10 +62,9 @@ func (c *Container) run(p *Process) error {
 		}
 		c.ownerPod.sv.Events.notifySubscribers(e)
 
-		resultCh <- err
-		close(resultCh)
-
+		glog.V(3).Infof("wait for container process exit")
 		exit, err := c.wait(p, res)
+		glog.V(3).Infof("container process exit")
 		e = Event{
 			ID:        c.Id,
 			Type:      EventExit,
