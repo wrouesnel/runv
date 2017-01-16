@@ -774,18 +774,24 @@ func GetVm(vmId string, b *BootConfig, waitStarted, lazy bool) (*Vm, error) {
 	}
 
 	if waitStarted {
+		glog.V(1).Info("waiting for vm to start")
 		if err := <-vm.WaitResponse(func(response *types.VmResponse) (error, bool) {
 			if response.Code == types.E_FAILED {
+				glog.Error("VM start failed")
 				return fmt.Errorf("vm start failed"), true
 			}
 			if response.Code == types.E_VM_RUNNING {
+				glog.V(1).Info("VM started successfully")
 				return nil, true
 			}
+			glog.Error("VM never started")
 			return nil, false
 		}, -1); err != nil {
+
 			vm.Kill()
 		}
 	}
 
+	glog.V(1).Info("GetVm succeeded (not waiting for startup)")
 	return vm, nil
 }

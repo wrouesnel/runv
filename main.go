@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"time"
+	"os/signal"
 
 	"github.com/codegangsta/cli"
 	"github.com/docker/containerd/api/grpc/types"
@@ -17,6 +18,8 @@ import (
 	netcontext "golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/grpclog"
+	"syscall"
+	"runtime"
 )
 
 const (
@@ -50,10 +53,36 @@ If not specified, the default value for the 'bundle' is the current directory.
 'Bundle' is the directory where '` + specConfig + `' must be located.`
 )
 
+// PrintStack prints to standard error the stack trace returned by runtime.Stack.
+func PrintStack() {
+	os.Stderr.Write(Stack())
+}
+
+// Stack returns a formatted stack trace of the goroutine that calls it.
+// It calls runtime.Stack with a large enough buffer to capture the entire trace.
+func Stack() []byte {
+	buf := make([]byte, 1024)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return buf[:n]
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+}
+
 func main() {
 	if reexec.Init() {
 		return
 	}
+
+	sigCh := make(chan os.Signal, 1)
+	go func() {
+		for _ = range sigCh {
+			PrintStack()
+		}
+	}()
+	signal.Notify(sigCh, syscall.SIGUSR1)
 
 	app := cli.NewApp()
 	app.Name = "runv"
@@ -123,6 +152,7 @@ func main() {
 		manageCommand,
 		containerd.ContainerdCommand,
 	}
+
 	if err := app.Run(os.Args); err != nil {
 		fmt.Printf("%s\n", err.Error())
 	}

@@ -196,6 +196,9 @@ func (ctx *VmContext) attachTty2Container(process *hyperstartapi.Process, cmd *A
 }
 
 func (ctx *VmContext) startPod() {
+	ctx.lock.Lock()
+	defer ctx.lock.Unlock()
+
 	ctx.vm <- &hyperstartCmd{
 		Code:    hyperstartapi.INIT_STARTPOD,
 		Message: ctx.networks.sandboxInfo(),
@@ -218,8 +221,12 @@ func (ctx *VmContext) poweroffVM(err bool, msg string) {
 	//REFACTOR: kill directly instead of DCtx.Shutdown() and send shutdown information
 	ctx.Log(INFO, "poweroff vm based on command: %s", msg)
 	if ctx != nil && ctx.handler != nil {
+		glog.V(3).Info("Calling driver kill command...")
 		ctx.DCtx.Kill(ctx)
+	} else {
+		glog.V(3).Info("Not calling driver kill command - ctx and ctx.handler == nil")
 	}
+	glog.V(3).Info("poweroffVM returned.")
 }
 
 func (ctx *VmContext) handleGenericOperation(goe *GenericOperation) {
@@ -237,6 +244,7 @@ func (ctx *VmContext) handleGenericOperation(goe *GenericOperation) {
 
 // state machine
 func unexpectedEventHandler(ctx *VmContext, ev VmEvent, state string) {
+	glog.V(3).Infof("unexpectedEventHandler: handling %s", EventString(ev.Event()))
 	switch ev.Event() {
 	case COMMAND_SHUTDOWN,
 		COMMAND_RELEASE,
@@ -248,6 +256,7 @@ func unexpectedEventHandler(ctx *VmContext, ev VmEvent, state string) {
 }
 
 func stateRunning(ctx *VmContext, ev VmEvent) {
+	glog.V(3).Infof("stateRunning: handling %s", EventString(ev.Event()))
 	switch ev.Event() {
 	case COMMAND_ONLINECPUMEM:
 		ctx.onlineCpuMem(ev.(*OnlineCpuMemCommand))
@@ -309,6 +318,7 @@ func stateRunning(ctx *VmContext, ev VmEvent) {
 }
 
 func stateTerminating(ctx *VmContext, ev VmEvent) {
+	glog.V(3).Infof("stateTerminating: handling %s", EventString(ev.Event()))
 	switch ev.Event() {
 	case EVENT_VM_EXIT:
 		glog.Info("Got VM shutdown event while terminating, go to cleaning up")
