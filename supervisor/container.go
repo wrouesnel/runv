@@ -18,53 +18,84 @@ import (
 	"github.com/hyperhq/runv/hypervisor"
 	"github.com/hyperhq/runv/lib/utils"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"sync"
 )
 
 type Container struct {
 	Id         string
 	BundlePath string
 	Spec       *specs.Spec
-	Processes  map[string]*Process
+	processes  map[string]*Process
 
 	ownerPod *HyperPod
+
+	// Protects Container.Processes
+	sync.RWMutex
+}
+
+// getProcess locks and retrieves a process struct from the given container.
+// It *does not* guarantee that the process will not be subsequently removed
+// from the container.
+func (c *Container) getProcess(processId string) *Process {
+	c.RLock()
+	defer c.RUnlock()
+
+	if p, ok := c.processes[processId]; ok {
+		return p
+	}
+	return nil
+}
+
+// reapProcess reaps a given process from the container
+func (c *Container) reapProcess(process string) error {
+	p := c.getProcess(process)
+	if p == nil {
+		return fmt.Errorf("reapProcess: container %s does not have a process %s", c.Id, process)
+	}
+
+	// Critical section: ensure no one can acquire the process while we reap it and delete it
+	c.Lock()
+	go p.reap()
+	delete(c.processes, process)
+	c.Unlock()
+
+	return nil
 }
 
 func (c *Container) run(p *Process) {
-	go func() {
-		err := c.create(p)
-		if err != nil {
-			c.ownerPod.sv.reap(c.Id, p.Id)
-			return
-		}
+	err := c.create(p)
+	if err != nil {
+		c.ownerPod.sv.reap(c.Id, p.Id)
+		return
+	}
 
-		res := c.ownerPod.vm.WaitProcess(true, []string{c.Id}, -1)
-		if res == nil {
-			c.ownerPod.sv.reap(c.Id, p.Id)
-			return
-		}
+	res := c.ownerPod.vm.WaitProcess(true, []string{c.Id}, -1)
+	if res == nil {
+		c.ownerPod.sv.reap(c.Id, p.Id)
+		return
+	}
 
-		err = c.start(p)
-		e := Event{
-			ID:        c.Id,
-			Type:      EventContainerStart,
-			Timestamp: time.Now(),
-		}
-		c.ownerPod.sv.Events.notifySubscribers(e)
+	err = c.start(p)
+	e := Event{
+		ID:        c.Id,
+		Type:      EventContainerStart,
+		Timestamp: time.Now(),
+	}
+	c.ownerPod.sv.Events.notifySubscribers(e)
 
-		exit, err := c.wait(p, res)
-		e = Event{
-			ID:        c.Id,
-			Type:      EventExit,
-			Timestamp: time.Now(),
-			PID:       p.Id,
-			Status:    -1,
-		}
-		if err == nil && exit != nil {
-			e.Timestamp = exit.FinishedAt
-			e.Status = exit.Code
-		}
-		c.ownerPod.sv.Events.notifySubscribers(e)
-	}()
+	exit, err := c.wait(p, res)
+	e = Event{
+		ID:        c.Id,
+		Type:      EventExit,
+		Timestamp: time.Now(),
+		PID:       p.Id,
+		Status:    -1,
+	}
+	if err == nil && exit != nil {
+		e.Timestamp = exit.FinishedAt
+		e.Status = exit.Code
+	}
+	c.ownerPod.sv.Events.notifySubscribers(e)
 }
 
 func (c *Container) create(p *Process) error {
