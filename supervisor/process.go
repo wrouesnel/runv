@@ -6,6 +6,8 @@ import (
 	"os"
 	"syscall"
 
+	"github.com/constabulary/gb/testdata/src/c"
+	"github.com/go-swagger/go-swagger/spec"
 	"github.com/golang/glog"
 	"github.com/hyperhq/runv/hypervisor"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -19,10 +21,16 @@ type Process struct {
 	Spec   *specs.Process
 	ProcId int
 
-	// inerId is Id or container id + "-init"
+	// vm holds the vm backing process that this process is talking to.
+	// This is a slightly leaky abstraction, but there's no scenario where a
+	// a pod's VM could be changed and container ops continue to make sense
+	// without some serious clean up process-side.
+	vm *hypervisor.Vm
+
+	// innerId is Id or container id + "-init"
 	// pass to hypervisor package and HyperPod.Processes
-	inerId      string
-	ownerCont   *Container
+	innerId string
+
 	init        bool
 	stdio       *hypervisor.TtyIO
 	stdinCloser io.Closer
@@ -63,10 +71,10 @@ func (p *Process) setupIO() error {
 
 func (p *Process) ttyResize(container string, width, height int) error {
 	// If working on the primary process, do not pass execId (it won't be recognized)
-	if p.inerId == fmt.Sprintf("%s-init", container) {
-		return p.ownerCont.ownerPod.vm.Tty(container, "", height, width)
+	if p.innerId == fmt.Sprintf("%s-init", container) {
+		return p.vm.Tty(container, "", height, width)
 	}
-	return p.ownerCont.ownerPod.vm.Tty(container, p.inerId, height, width)
+	return p.vm.Tty(container, p.innerId, height, width)
 }
 
 func (p *Process) closeStdin() error {
@@ -78,16 +86,11 @@ func (p *Process) closeStdin() error {
 	return err
 }
 
-func (p *Process) signal(sig int) error {
-	if p.init {
-		// TODO: change vm.KillContainer()
-		return p.ownerCont.ownerPod.vm.KillContainer(p.ownerCont.Id, syscall.Signal(sig))
-	} else {
-		// TODO support it
-		return fmt.Errorf("Kill to non-init process of container is unsupported")
-	}
+func (p *Process) Signal(sig int) error {
+	return fmt.Errorf("Kill to non-init process of container is unsupported")
 }
 
 func (p *Process) reap() {
 	p.closeStdin()
+	// TODO: support killing non-init in the VM
 }

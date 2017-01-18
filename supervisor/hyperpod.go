@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/constabulary/gb/testdata/src/c"
 	"github.com/golang/glog"
 	"github.com/hyperhq/runv/api"
 	"github.com/hyperhq/runv/factory"
@@ -19,6 +20,7 @@ import (
 	"github.com/kardianos/osext"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/vishvananda/netlink"
+	"sync"
 )
 
 type NetlinkUpdateType string
@@ -44,15 +46,23 @@ type NetlinkUpdate struct {
 }
 
 type HyperPod struct {
-	Containers map[string]*Container
-	Processes  map[string]*Process
+	containers map[string]*Container
 
-	//userPod   *pod.UserPod
-	//podStatus *hypervisor.PodStatus
+	// vm associated with this pod. Containers and Processes inherit this.
 	vm *hypervisor.Vm
-	sv *Supervisor
 
 	nslistener *nsListener
+
+	// stateDir root for containers for this pod
+	stateDir string
+
+	// notifyFn is a creator-provided function to dispatch container events from
+	// this HyperPod
+	notifyFn func(e Event)
+
+	// Protects HyperPod.containers : specifically, guarantees containerIds are
+	// unique between create operations.
+	sync.RWMutex
 }
 
 type InterfaceInfo struct {
@@ -124,17 +134,27 @@ func GetBridgeFromIndex(idx int) (string, error) {
 	return bridge.Name, nil
 }
 
-func (hp *HyperPod) initPodNetwork(c *Container) error {
+func (hp *HyperPod) notify(e Event) {
+	if hp.notifyFn != nil {
+		hp.notifyFn(e)
+	}
+}
+
+func (hp *HyperPod) initPodNetwork(containerSpec *specs.Spec) error {
 	// Only start first container will setup netns
-	if len(hp.Containers) > 1 {
+	if len(hp.containers) > 1 {
+		glog.V(3).Info("initPodNetwork: network already initialized or pod")
 		return nil
 	}
 
 	// container has no prestart hooks, means no net for this container
-	if len(c.Spec.Hooks.Prestart) == 0 {
+	if len(containerSpec.Hooks.Prestart) == 0 {
 		// FIXME: need receive interface settting?
+		glog.V(3).Info("initPodNetwork: no network for this container")
 		return nil
 	}
+
+	glog.V(1).Info("initPodNetwork: setup pod networking for new pod")
 
 	listener := hp.nslistener
 
@@ -378,46 +398,84 @@ func (hp *HyperPod) getNsPid() int {
 	return hp.nslistener.cmd.Process.Pid
 }
 
-func (hp *HyperPod) createContainer(container, bundlePath, stdin, stdout, stderr string, spec *specs.Spec) (*Container, error) {
-	inerProcessId := container + "-init"
-	if _, ok := hp.Processes[inerProcessId]; ok {
-		return nil, fmt.Errorf("The process id: %s is in used", inerProcessId)
+func (c *HyperPod) countContainers() int {
+	c.RLock()
+	defer c.RUnlock()
+	return len(c.containers)
+}
+
+// getContainer safely searches for a container in the pod. Returns nil if the
+// container is not found.
+func (hp *HyperPod) getContainer(containerId string) *Container {
+	hp.RLock()
+	defer hp.RUnlock()
+
+	if c, found := hp.containers[containerId]; found {
+		return c
 	}
+
+	return nil
+}
+
+// createContainer creates a new container, adds the init process, and runs it.
+func (hp *HyperPod) createContainer(container, bundlePath, stdin, stdout, stderr string, spec *specs.Spec) (*Container, error) {
+	innerProcessId := container + "-init"
+
+	// Get a write lock. If the container can't be created, we'll release it,
+	// but if it can be created we need to hold the lock until the ID has been
+	// claimed.
+	hp.Lock()
+	defer hp.Unlock()
+
+	// innerProcessId's are deterministic from the above, so we can always
+	// check containerIds directly.
+	if _, found := hp.containers[container]; found {
+		return nil, fmt.Errorf("The process id: %s is in used", innerProcessId)
+	}
+
 	glog.Infof("createContainer()")
 
-	c := &Container{
-		Id:         container,
-		BundlePath: bundlePath,
-		Spec:       spec,
-		Processes:  make(map[string]*Process),
-		ownerPod:   hp,
-	}
-
-	p := &Process{
-		Id:     "init",
-		Stdin:  stdin,
-		Stdout: stdout,
-		Stderr: stderr,
-		Spec:   &spec.Process,
-		ProcId: c.ownerPod.getNsPid(),
-
-		inerId:    inerProcessId,
-		ownerCont: c,
-		init:      true,
-	}
-	err := p.setupIO()
-	if err != nil {
+	if err := hp.initPodNetwork(spec); err != nil {
+		glog.Errorf("fail to initialize pod network %v", err)
 		return nil, err
 	}
-	glog.Infof("createContainer()")
 
-	c.Processes["init"] = p
-	c.ownerPod.Processes[inerProcessId] = p
-	c.ownerPod.Containers[container] = c
+	c := NewContainer(
+		container,
+		bundlePath,
+		stdin,
+		stdout,
+		stderr,
+		spec,
+		hp.getNsPid(),
+		hp.stateDir,
+		hp.notify,
+	)
 
-	glog.Infof("createContainer() calls c.run(p)")
-	c.run(p)
+	glog.Infof("createContainer() calls c.run()")
+	if err := c.run(); err != nil {
+		return nil, err
+	}
 	return c, nil
+}
+
+// addProcess wraps a container's addProcess to provide pod-leve assurances
+func (hp *HyperPod) addProcess(containerId, processId, stdin, stdout, stderr string, spec *specs.Process) (*Process, error) {
+	hp.Lock()
+	for _, c := range hp.containers {
+		if c.getProcess(processId) != nil {
+			hp.Unlock()
+			return nil, fmt.Errorf("conflict process ID (pod)")
+		}
+	}
+	// No conflicts. Get get container.
+	c := hp.getContainer(containerId)
+	hp.Unlock()
+
+	if c == nil {
+		return nil, fmt.Errorf("container (%s) has already exited", containerId)
+	}
+	return c.addProcess(processId, stdin, stdout, stderr, spec)
 }
 
 func chooseKernel(spec *specs.Spec) (kernel string) {
@@ -446,7 +504,7 @@ func chooseInitrd(spec *specs.Spec) (initrd string) {
 	return
 }
 
-func createHyperPod(f factory.Factory, spec *specs.Spec, defaultCpus int, defaultMemory int) (*HyperPod, error) {
+func createHyperPod(f factory.Factory, spec *specs.Spec, defaultCpus int, defaultMemory int, stateDir string, notifyFn func(e Event)) (*HyperPod, error) {
 	cpu := defaultCpus
 	mem := defaultMemory
 	if spec.Linux != nil && spec.Linux.Resources != nil && spec.Linux.Resources.Memory != nil && spec.Linux.Resources.Memory.Limit != nil {
@@ -506,8 +564,9 @@ func createHyperPod(f factory.Factory, spec *specs.Spec, defaultCpus int, defaul
 
 	hp := &HyperPod{
 		vm:         vm,
-		Containers: make(map[string]*Container),
-		Processes:  make(map[string]*Process),
+		containers: make(map[string]*Container),
+		stateDir:   stateDir,
+		notifyFn:   notifyFn,
 	}
 
 	// create Listener process running in its own netns
@@ -518,6 +577,22 @@ func createHyperPod(f factory.Factory, spec *specs.Spec, defaultCpus int, defaul
 	}
 
 	return hp, nil
+}
+
+// reapProcess reaps the given process from the given container
+func (hp *HyperPod) reapProcess(container, processId string) error {
+	hp.Lock()
+	defer hp.Unlock()
+	if c, found := hp.containers[container]; found {
+		c.reapProcess(processId)
+		if c.countProcesses() == 0 {
+			go c.reap()
+			delete(hp.containers, container)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("reapProcess: pod does not have container %s", container)
 }
 
 func (hp *HyperPod) reap() {

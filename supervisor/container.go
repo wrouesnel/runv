@@ -19,18 +19,88 @@ import (
 	"github.com/hyperhq/runv/lib/utils"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"sync"
+	"syscall"
+)
+
+const (
+	ContainerInitProcessId string = "init"
 )
 
 type Container struct {
-	Id         string
-	BundlePath string
-	Spec       *specs.Spec
-	processes  map[string]*Process
+	Id          string
+	BundlePath  string
+	Spec        *specs.Spec
+	NamespaceId int
 
-	ownerPod *HyperPod
+	// vm holds the vm backing process that this container is talking to.
+	// This is a slightly leaky abstraction, but there's no scenario where a
+	// a pod's VM could be changed and container ops continue to make sense
+	// without some serious clean up container-side.
+	vm *hypervisor.Vm
+
+	// Subprocesses (including init) managed by this container.
+	processes map[string]*Process
+
+	// Container state directory
+	stateDir string
+
+	// notifyFn is a creator-provided function to dispatch container events
+	notifyFn func(e Event)
 
 	// Protects Container.Processes
 	sync.RWMutex
+}
+
+// NewContainer creates and initializes a new container and it's init process.
+func NewContainer(containerId, bundlePath, stdin, stdout, stderr string, spec *specs.Spec, namespaceId int, stateDir string, notifyFn func(e Event)) *Container {
+	// Create the container
+	c := &Container{
+		Id:          containerId,
+		BundlePath:  bundlePath,
+		Spec:        spec,
+		NamespaceId: namespaceId,
+		processes:   make(map[string]*Process),
+		stateDir:    stateDir,
+		notifyFn:    notifyFn,
+	}
+	// Create the init process
+	innerProcessId := containerId + "-init"
+	p := &Process{
+		Id:     ContainerInitProcessId,
+		Stdin:  stdin,
+		Stdout: stdout,
+		Stderr: stderr,
+		Spec:   &spec.Process,
+		ProcId: namespaceId,
+
+		innerId: innerProcessId,
+		init:    true,
+	}
+	// Setup the init process.
+	if err := p.setupIO(); err != nil {
+		return nil
+	}
+
+	// Add the process to the map (no locking needed because no one knows
+	// about this container yet.
+	c.processes[p.Id] = p
+
+	return c
+}
+
+// notify calls notifyFn if it is set to dispatch a container event if an
+// event handler is set.
+func (c *Container) notify(e Event) {
+	if c.notifyFn != nil {
+		c.notifyFn(e)
+	}
+}
+
+func (c *Container) countProcesses() int {
+	c.RLock()
+	defer c.RUnlock()
+
+	return len(c.processes)
 }
 
 // getProcess locks and retrieves a process struct from the given container.
@@ -46,56 +116,61 @@ func (c *Container) getProcess(processId string) *Process {
 	return nil
 }
 
-// reapProcess reaps a given process from the container
-func (c *Container) reapProcess(process string) error {
-	p := c.getProcess(process)
+// run launches this container. It is non-blocking once the
+// pod has acknowledged the process has been successfully started (the process
+// may still exit immediately via normal POSIX mechanisms).
+func (c *Container) run() error {
+	p := c.getProcess(ContainerInitProcessId)
 	if p == nil {
-		return fmt.Errorf("reapProcess: container %s does not have a process %s", c.Id, process)
+		return fmt.Errorf("Attempting to run container (%s) with reaped init process", c.Id)
 	}
 
-	// Critical section: ensure no one can acquire the process while we reap it and delete it
-	c.Lock()
-	go p.reap()
-	delete(c.processes, process)
-	c.Unlock()
-
-	return nil
-}
-
-func (c *Container) run(p *Process) {
+	// Try and create the process
 	err := c.create(p)
 	if err != nil {
-		c.ownerPod.sv.reap(c.Id, p.Id)
-		return
+		return err
 	}
-
-	res := c.ownerPod.vm.WaitProcess(true, []string{c.Id}, -1)
+	// Wait for the VM to acknowledge the process
+	res := c.vm.WaitProcess(true, []string{c.Id}, -1)
 	if res == nil {
-		c.ownerPod.sv.reap(c.Id, p.Id)
-		return
+		return err
 	}
-
+	// Start the process. If the startup fails, return the error now.
 	err = c.start(p)
+	if err != nil {
+		return err
+	}
+	// Notify subscribers of the new process.
 	e := Event{
 		ID:        c.Id,
 		Type:      EventContainerStart,
 		Timestamp: time.Now(),
 	}
-	c.ownerPod.sv.Events.notifySubscribers(e)
+	c.notify(e)
+	// It is now safe to return control to the caller (this prevents docker-likes
+	// from blocking when trying to send multiple commands before startup
+	// finishes.
 
-	exit, err := c.wait(p, res)
-	e = Event{
-		ID:        c.Id,
-		Type:      EventExit,
-		Timestamp: time.Now(),
-		PID:       p.Id,
-		Status:    -1,
-	}
-	if err == nil && exit != nil {
-		e.Timestamp = exit.FinishedAt
-		e.Status = exit.Code
-	}
-	c.ownerPod.sv.Events.notifySubscribers(e)
+	// The rest of this function runs asynchronously.
+	go func() {
+		exit, err := c.wait(p, res)
+		e = Event{
+			ID:        c.Id,
+			Type:      EventExit,
+			Timestamp: time.Now(),
+			PID:       p.Id,
+			Status:    -1,
+		}
+		if err == nil && exit != nil {
+			e.Timestamp = exit.FinishedAt
+			e.Status = exit.Code
+		}
+		c.notify(e)
+		// Reap the finished init process.
+		c.reapProcess(ContainerInitProcessId)
+	}()
+
+	return nil
 }
 
 func (c *Container) create(p *Process) error {
@@ -108,7 +183,7 @@ func (c *Container) create(p *Process) error {
 	if !filepath.IsAbs(rootPath) {
 		rootPath = filepath.Join(c.BundlePath, rootPath)
 	}
-	vmRootfs := filepath.Join(hypervisor.BaseDir, c.ownerPod.vm.Id, hypervisor.ShareDirTag, c.Id, "rootfs")
+	vmRootfs := filepath.Join(hypervisor.BaseDir, c.vm.Id, hypervisor.ShareDirTag, c.Id, "rootfs")
 	os.MkdirAll(vmRootfs, 0755)
 
 	// Mount rootfs
@@ -140,7 +215,7 @@ func (c *Container) create(p *Process) error {
 		}
 	}
 
-	r := c.ownerPod.vm.AddContainer(config)
+	r := c.vm.AddContainer(config)
 	if !r.IsSuccess() {
 		return fmt.Errorf("add container %s failed: %s", c.Id, r.Message())
 	}
@@ -150,8 +225,8 @@ func (c *Container) create(p *Process) error {
 
 func (c *Container) start(p *Process) error {
 
-	glog.V(3).Infof("save state id %s, boundle %s", c.Id, c.BundlePath)
-	stateDir := filepath.Join(c.ownerPod.sv.StateDir, c.Id)
+	glog.V(3).Infof("save state id %s, bundle %s", c.Id, c.BundlePath)
+	stateDir := filepath.Join(c.stateDir, c.Id)
 	_, err := os.Stat(stateDir)
 	if err == nil {
 		glog.V(1).Infof("Container %s exists\n", c.Id)
@@ -166,7 +241,7 @@ func (c *Container) start(p *Process) error {
 	state := &specs.State{
 		Version:    c.Spec.Version,
 		ID:         c.Id,
-		Pid:        c.ownerPod.getNsPid(),
+		Pid:        c.NamespaceId,
 		BundlePath: c.BundlePath,
 	}
 	stateData, err := json.MarshalIndent(state, "", "\t")
@@ -181,7 +256,7 @@ func (c *Container) start(p *Process) error {
 		return err
 	}
 
-	err = c.ownerPod.vm.Attach(p.stdio, c.Id, nil)
+	err = c.vm.Attach(p.stdio, c.Id, nil)
 	if err != nil {
 		glog.V(1).Infof("StartPod fail: fail to set up tty connection.\n")
 		return err
@@ -193,14 +268,8 @@ func (c *Container) start(p *Process) error {
 		return err
 	}
 
-	err = c.ownerPod.initPodNetwork(c)
-	if err != nil {
-		glog.Errorf("fail to initialize pod network %v", err)
-		return err
-	}
-
 	//Todo: vm.AddContainer here
-	return c.ownerPod.vm.StartContainer(c.Id)
+	return c.vm.StartContainer(c.Id)
 }
 
 func (c *Container) wait(p *Process, result <-chan *api.ProcessExit) (*api.ProcessExit, error) {
@@ -230,18 +299,25 @@ func (c *Container) wait(p *Process, result <-chan *api.ProcessExit) (*api.Proce
 	return exit, nil
 }
 
+// addProcess adds a process to the current container. It is called by
+// HyperPod.addProcess, which validates processId uniqueness at the pod-level.
 func (c *Container) addProcess(processId, stdin, stdout, stderr string, spec *specs.Process) (*Process, error) {
-	if _, ok := c.ownerPod.Processes[processId]; ok {
-		return nil, fmt.Errorf("conflict process ID")
+	// Lock the container while doing a processID check - if failed, we
+	// unlock, but if success we need to ensure no other process with that ID
+	// is created before we finish.
+	c.Lock()
+	defer c.Unlock()
+
+	if _, ok := c.processes[processId]; ok {
+		return nil, fmt.Errorf("conflict process ID (%s)", processId)
 	}
-	if _, ok := c.Processes[processId]; ok {
-		return nil, fmt.Errorf("conflict process ID")
-	}
-	if _, ok := c.Processes["init"]; !ok {
+	// check init process has not exited
+	if _, ok := c.processes["init"]; !ok {
 		return nil, fmt.Errorf("init process of the container %s had already exited", c.Id)
 	}
+	// check we're not trying to add another init process
 	if processId == "init" { // test in case the init process is being reaped
-		return nil, fmt.Errorf("conflict process ID")
+		return nil, fmt.Errorf("conflict process ID (%s)", processId)
 	}
 
 	p := &Process{
@@ -252,38 +328,36 @@ func (c *Container) addProcess(processId, stdin, stdout, stderr string, spec *sp
 		Spec:   spec,
 		ProcId: -1,
 
-		inerId:    processId,
-		ownerCont: c,
+		innerId: processId,
 	}
-	err := p.setupIO()
-	if err != nil {
+	if err := p.setupIO(); err != nil {
 		return nil, err
 	}
-
-	c.ownerPod.Processes[processId] = p
-	c.Processes[processId] = p
-
+	// Start a waiter in the VM for the results.
+	resultCh := c.vm.WaitProcess(false, []string{processId}, -1)
+	// Add the process to the container.
+	err := c.vm.AddProcess(c.Id, processId, spec.Terminal, spec.Args, spec.Env, spec.Cwd, p.stdio)
+	if err != nil {
+		glog.V(1).Infof("add process to container failed: %v\n", err)
+		return nil, err
+	}
+	// Container was added successfully, so add to container state
+	c.processes[processId] = p
+	// And notify event watchers
 	e := Event{
 		ID:        c.Id,
 		Type:      EventProcessStart,
 		Timestamp: time.Now(),
 		PID:       processId,
 	}
-	c.ownerPod.sv.Events.notifySubscribers(e)
+	c.notify(e)
 
+	// The rest of this function runs asynchronously to wait for the exit
+	// (note how it does absolutely no manipulation of the processes map)
 	go func() {
-		var (
-			exit *api.ProcessExit
-		)
-		reschan := c.ownerPod.vm.WaitProcess(false, []string{processId}, -1)
-
-		err := c.ownerPod.vm.AddProcess(c.Id, processId, spec.Terminal, spec.Args, spec.Env, spec.Cwd, p.stdio)
-		if err != nil {
-			glog.V(1).Infof("add process to container failed: %v\n", err)
-		} else {
-			exit, _ = <-reschan
-		}
-
+		// Get the exit code
+		exit := <-resultCh
+		// Prepare the event
 		e := Event{
 			ID:        c.Id,
 			Type:      EventExit,
@@ -291,15 +365,15 @@ func (c *Container) addProcess(processId, stdin, stdout, stderr string, spec *sp
 			PID:       processId,
 			Status:    -1,
 		}
-		if err != nil {
-			glog.V(1).Infof("get exit code failed %s\n", err.Error())
-		} else {
-			if exit != nil {
-				e.Status = int(exit.Code)
-				e.Timestamp = exit.FinishedAt
-			}
+		// If the exit code was received, update the event
+		if exit != nil {
+			e.Status = int(exit.Code)
+			e.Timestamp = exit.FinishedAt
 		}
-		c.ownerPod.sv.Events.notifySubscribers(e)
+		// Notify event watchers of exit
+		c.notify(e)
+		// Reap the process
+		c.reapProcess(processId)
 	}()
 	return p, nil
 }
@@ -351,11 +425,50 @@ func execPoststopHooks(rt *specs.Spec, state *specs.State) error {
 	return nil
 }
 
+// Signal forwards a signal to a process in this container
+func (c *Container) Signal(processId string, sig int) error {
+	p := c.getProcess(processId)
+	if p.init {
+		// TODO: change vm.KillContainer()
+		return c.vm.KillContainer(c.Id, syscall.Signal(sig))
+	}
+	return p.Signal(sig)
+}
+
+// reapProcess reaps a given process from the container
+func (c *Container) reapProcess(process string) error {
+	// Critical section: ensure no one can acquire the process from the container
+	// while we reap it and delete it
+	c.Lock()
+	defer c.Unlock()
+	p, found := c.processes[process]
+	if !found {
+		return fmt.Errorf("reapProcess: container %s does not have a process %s", c.Id, process)
+	}
+	go p.reap()
+	delete(c.processes, process)
+
+	// TODO: kill all other processes if init process is killed.
+	// Note: depends on support for killing non-init processes in containers in
+	// Process
+	if p.init {
+		// TODO: support killing processes
+		//glog.V(1).Infof("Container (%s) init killed. Killing remaining container processes.")
+		//for pid, p := range c.processes {
+		//	glog.V(3).Infof("Container (%s): init killed - reaping process %s", c.Id, pid)
+		//	go p.reap()
+		//	delete(c.processes, pid)
+		//}
+	}
+
+	return nil
+}
+
 func (c *Container) reap() {
-	containerSharedDir := filepath.Join(hypervisor.BaseDir, c.ownerPod.vm.Id, hypervisor.ShareDirTag, c.Id)
+	containerSharedDir := filepath.Join(hypervisor.BaseDir, c.vm.Id, hypervisor.ShareDirTag, c.Id)
 	utils.Umount(filepath.Join(containerSharedDir, "rootfs"))
 	os.RemoveAll(containerSharedDir)
-	os.RemoveAll(filepath.Join(c.ownerPod.sv.StateDir, c.Id))
+	os.RemoveAll(filepath.Join(c.stateDir, c.Id))
 }
 
 func mountToRootfs(m *specs.Mount, rootfs, mountLabel string) error {
