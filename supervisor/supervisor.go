@@ -92,10 +92,11 @@ func (sv *Supervisor) CreateContainer(container, bundlePath, stdin, stdout, stde
 	// This locking is needed to resolve the race in creating hyperpods.
 	// It is made an error to send multiple CreateContainer requests with the
 	// same containerId when one is already in progress.
+	// TODO: this should actually block, but just not hold the lock
 	sv.containerQueueMtx.Lock()
 	if _, found := sv.containerQueue[container]; found {
 		sv.containerQueueMtx.Unlock()
-		return nil, nil, fmt.Errorf("container %s is already being created by anothe request.", container)
+		return nil, nil, fmt.Errorf("container %s is already being created by another request.", container)
 	} else {
 		// Add the container to the queue
 		sv.containerQueue[container] = struct{}{}

@@ -465,6 +465,7 @@ func (hp *HyperPod) CreateContainer(container, bundlePath, stdin, stdout, stderr
 		stderr,
 		spec,
 		hp.getNsPid(),
+		hp.vm,
 		hp.stateDir,
 		hp.notify,
 	)

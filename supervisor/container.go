@@ -55,13 +55,14 @@ type Container struct {
 }
 
 // NewContainer creates and initializes a new container and it's init process.
-func NewContainer(containerId, bundlePath, stdin, stdout, stderr string, spec *specs.Spec, namespaceId int, stateDir string, notifyFn func(e Event)) *Container {
+func NewContainer(containerId, bundlePath, stdin, stdout, stderr string, spec *specs.Spec, namespaceId int, vm *hypervisor.Vm, stateDir string, notifyFn func(e Event)) *Container {
 	// Create the container
 	c := &Container{
 		Id:          containerId,
 		BundlePath:  bundlePath,
 		Spec:        spec,
 		NamespaceId: namespaceId,
+		vm:			 vm,
 		processes:   make(map[string]*Process),
 		stateDir:    stateDir,
 		notifyFn:    notifyFn,
@@ -77,6 +78,7 @@ func NewContainer(containerId, bundlePath, stdin, stdout, stderr string, spec *s
 		Spec:   &spec.Process,
 		ProcId: namespaceId,
 
+		vm:		 vm,
 		innerId: innerProcessId,
 		init:    true,
 		reaping: make(chan bool),
@@ -351,6 +353,7 @@ func (c *Container) AddProcess(processId, stdin, stdout, stderr string, spec *sp
 		Spec:   spec,
 		ProcId: -1,
 
+		vm:		 c.vm,
 		innerId: processId,
 	}
 	if err := p.setupIO(); err != nil {
