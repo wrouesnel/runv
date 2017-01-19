@@ -12,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/constabulary/gb/testdata/src/c"
 	"github.com/golang/glog"
 	"github.com/hyperhq/runv/api"
 	"github.com/hyperhq/runv/factory"
@@ -59,6 +58,10 @@ type HyperPod struct {
 	// notifyFn is a creator-provided function to dispatch container events from
 	// this HyperPod
 	notifyFn func(e Event)
+
+	// flag channel if container is shutting down/has shutdown. channel is
+	// closed when it is true.
+	reaping chan bool
 
 	// Protects HyperPod.containers : specifically, guarantees containerIds are
 	// unique between create operations.
@@ -398,17 +401,14 @@ func (hp *HyperPod) getNsPid() int {
 	return hp.nslistener.cmd.Process.Pid
 }
 
-func (c *HyperPod) countContainers() int {
-	c.RLock()
-	defer c.RUnlock()
-	return len(c.containers)
-}
-
 // getContainer safely searches for a container in the pod. Returns nil if the
 // container is not found.
 func (hp *HyperPod) getContainer(containerId string) *Container {
 	hp.RLock()
 	defer hp.RUnlock()
+	if hp.ShouldReap() {
+		return nil
+	}
 
 	if c, found := hp.containers[containerId]; found {
 		return c
@@ -417,8 +417,25 @@ func (hp *HyperPod) getContainer(containerId string) *Container {
 	return nil
 }
 
-// createContainer creates a new container, adds the init process, and runs it.
-func (hp *HyperPod) createContainer(container, bundlePath, stdin, stdout, stderr string, spec *specs.Spec) (*Container, error) {
+func (hp *HyperPod) ListContainers() []*Container {
+	hp.RLock()
+	defer hp.RUnlock()
+
+	returnedList := []*Container{}
+
+	if hp.ShouldReap() {
+		return returnedList
+	}
+
+	for _, c := range hp.containers {
+		returnedList = append(returnedList, c)
+	}
+
+	return returnedList
+}
+
+// CreateContainer creates a new container, adds the init process, and runs it.
+func (hp *HyperPod) CreateContainer(container, bundlePath, stdin, stdout, stderr string, spec *specs.Spec) (*Container, error) {
 	innerProcessId := container + "-init"
 
 	// Get a write lock. If the container can't be created, we'll release it,
@@ -433,7 +450,7 @@ func (hp *HyperPod) createContainer(container, bundlePath, stdin, stdout, stderr
 		return nil, fmt.Errorf("The process id: %s is in used", innerProcessId)
 	}
 
-	glog.Infof("createContainer()")
+	glog.Infof("CreateContainer()")
 
 	if err := hp.initPodNetwork(spec); err != nil {
 		glog.Errorf("fail to initialize pod network %v", err)
@@ -452,30 +469,27 @@ func (hp *HyperPod) createContainer(container, bundlePath, stdin, stdout, stderr
 		hp.notify,
 	)
 
-	glog.Infof("createContainer() calls c.run()")
+	glog.Infof("CreateContainer() calls c.run()")
 	if err := c.run(); err != nil {
 		return nil, err
 	}
 	return c, nil
 }
 
-// addProcess wraps a container's addProcess to provide pod-leve assurances
-func (hp *HyperPod) addProcess(containerId, processId, stdin, stdout, stderr string, spec *specs.Process) (*Process, error) {
-	hp.Lock()
-	for _, c := range hp.containers {
-		if c.getProcess(processId) != nil {
-			hp.Unlock()
-			return nil, fmt.Errorf("conflict process ID (pod)")
-		}
-	}
+// AddProcess wraps a container's AddProcess to provide pod-leve assurances
+func (hp *HyperPod) AddProcess(containerId, processId, stdin, stdout, stderr string, spec *specs.Process) (*Process, error) {
 	// No conflicts. Get get container.
 	c := hp.getContainer(containerId)
-	hp.Unlock()
-
 	if c == nil {
 		return nil, fmt.Errorf("container (%s) has already exited", containerId)
 	}
-	return c.addProcess(processId, stdin, stdout, stderr, spec)
+	// If container being reaped, this will return nil, but AddProcess will fail
+	// because container is being reaped.
+	if c.getProcess(processId) != nil {
+		return nil, fmt.Errorf("conflict process ID (pod)")
+	}
+
+	return c.AddProcess(processId, stdin, stdout, stderr, spec)
 }
 
 func chooseKernel(spec *specs.Spec) (kernel string) {
@@ -504,7 +518,7 @@ func chooseInitrd(spec *specs.Spec) (initrd string) {
 	return
 }
 
-func createHyperPod(f factory.Factory, spec *specs.Spec, defaultCpus int, defaultMemory int, stateDir string, notifyFn func(e Event)) (*HyperPod, error) {
+func CreateHyperPod(f factory.Factory, spec *specs.Spec, defaultCpus int, defaultMemory int, stateDir string, notifyFn func(e Event)) (*HyperPod, error) {
 	cpu := defaultCpus
 	mem := defaultMemory
 	if spec.Linux != nil && spec.Linux.Resources != nil && spec.Linux.Resources.Memory != nil && spec.Linux.Resources.Memory.Limit != nil {
@@ -567,11 +581,12 @@ func createHyperPod(f factory.Factory, spec *specs.Spec, defaultCpus int, defaul
 		containers: make(map[string]*Container),
 		stateDir:   stateDir,
 		notifyFn:   notifyFn,
+		reaping:    make(chan bool),
 	}
 
 	// create Listener process running in its own netns
 	if err = hp.startNsListener(); err != nil {
-		hp.reap()
+		go hp.reap()
 		glog.V(1).Infof("start ns listener fail: %s\n", err.Error())
 		return nil, err
 	}
@@ -580,22 +595,39 @@ func createHyperPod(f factory.Factory, spec *specs.Spec, defaultCpus int, defaul
 }
 
 // reapProcess reaps the given process from the given container
-func (hp *HyperPod) reapProcess(container, processId string) error {
-	hp.Lock()
-	defer hp.Unlock()
-	if c, found := hp.containers[container]; found {
-		c.reapProcess(processId)
-		if c.countProcesses() == 0 {
-			go c.reap()
-			delete(hp.containers, container)
-			return nil
-		}
+func (hp *HyperPod) ReapProcess(container, processId string) error {
+	c := hp.getContainer(container)
+	if c == nil {
+		return fmt.Errorf("reapProcess: pod does not have container %s", container)
 	}
 
-	return fmt.Errorf("reapProcess: pod does not have container %s", container)
+	c.ReapProcess(processId)
+	// Check if container self-reaped and follow
+	if c.ShouldReap() {
+		delete(hp.containers, container)
+	}
+
+	// Was that the last container? If so, pod is now reapable
+	if len(hp.containers) == 0 {
+		close(hp.reaping)
+		go hp.reap()
+	}
+	return nil
+}
+
+// ShouldReap returns whether this object is ready to be reaped from it's owner.
+func (hp *HyperPod) ShouldReap() bool {
+	select {
+	case <-hp.reaping:
+		return true
+	default:
+		return false
+	}
 }
 
 func (hp *HyperPod) reap() {
+	close(hp.reaping)
+
 	result := make(chan api.Result, 1)
 	go func() {
 		result <- hp.vm.Shutdown()

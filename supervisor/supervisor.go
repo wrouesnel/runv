@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/constabulary/gb/testdata/src/c"
 	"github.com/golang/glog"
 	"github.com/hyperhq/runv/factory"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -74,6 +73,21 @@ func (sv *Supervisor) getPod(container string) *HyperPod {
 	return nil
 }
 
+func (sv *Supervisor) ListContainers() []*Container {
+	sv.podsMtx.RLock()
+	defer sv.podsMtx.RUnlock()
+
+	returnedList := []*Container{}
+
+	for _, pod := range sv.pods {
+		for _, c := range pod.ListContainers() {
+			returnedList = append(returnedList, c)
+		}
+	}
+
+	return returnedList
+}
+
 func (sv *Supervisor) CreateContainer(container, bundlePath, stdin, stdout, stderr string, spec *specs.Spec) (*Container, *Process, error) {
 	// This locking is needed to resolve the race in creating hyperpods.
 	// It is made an error to send multiple CreateContainer requests with the
@@ -92,7 +106,7 @@ func (sv *Supervisor) CreateContainer(container, bundlePath, stdin, stdout, stde
 	if err != nil {
 		return nil, nil, err
 	}
-	c, err := hp.createContainer(container, bundlePath, stdin, stdout, stderr, spec)
+	c, err := hp.CreateContainer(container, bundlePath, stdin, stdout, stderr, spec)
 	// Unlock containerId as soon as container creation has finished, regardless
 	// of success or failure.
 	sv.containerQueueMtx.Lock()
@@ -110,7 +124,7 @@ func (sv *Supervisor) CreateContainer(container, bundlePath, stdin, stdout, stde
 
 func (sv *Supervisor) AddProcess(container, processId, stdin, stdout, stderr string, spec *specs.Process) (*Process, error) {
 	if pod := sv.getPod(container); pod != nil {
-		return pod.addProcess(container, processId, stdin, stdout, stderr, spec)
+		return pod.AddProcess(container, processId, stdin, stdout, stderr, spec)
 	}
 	return nil, fmt.Errorf("container %s is not found for AddProcess()", container)
 }
@@ -119,7 +133,7 @@ func (sv *Supervisor) TtyResize(container, processId string, width, height int) 
 	if pod := sv.getPod(container); pod != nil {
 		if c := pod.getContainer(container); c != nil {
 			if p := c.getProcess(processId); p != nil {
-				return p.ttyResize(container, width, height)
+				return p.TtyResize(container, width, height)
 			}
 			return fmt.Errorf("The process %s is not found in the container %s", processId, container)
 		}
@@ -155,7 +169,7 @@ func (sv *Supervisor) reaper() {
 	events := sv.Events.Events(time.Time{})
 	for e := range events {
 		if e.Type == EventExit {
-			go sv.reapProcess(e.ID, e.PID)
+			sv.reapProcess(e.ID, e.PID)
 		}
 	}
 }
@@ -167,37 +181,28 @@ func (sv *Supervisor) reapProcess(container, processId string) {
 	sv.podsMtx.Lock()
 	defer sv.podsMtx.Unlock()
 
-	for _, pod := range sv.pods {
-		pod.getContainer(container)
-	}
+	var targetPod *HyperPod
+	podIdx := -1
 
-	if pod := sv.getPod(container); pod != nil {
-		pod.reapProcess(container, processId)
-
-		// Does the pod have any containers left?
-		if pod.countContainers() == 0 {
-
+	for idx, pod := range sv.pods {
+		if c := pod.getContainer(container); c != nil {
+			podIdx = idx
+			targetPod = pod
+			break
 		}
 	}
 
-	//if c, ok := sv.containers[container]; ok {
-	//	if p, ok := c.Processes[processId]; ok {
-	//		go p.reap()
-	//		delete(c.ownerPod.Processes, processId)
-	//		delete(c.Processes, processId)
-	//		if p.init {
-	//			// TODO: kill all the other existing processes in the same container
-	//		}
-	//		if len(c.Processes) == 0 {
-	//			go c.reap()
-	//			delete(c.ownerPod.containers, container)
-	//			delete(sv.containers, container)
-	//		}
-	//		if len(c.ownerPod.containers) == 0 {
-	//			go c.ownerPod.reap()
-	//		}
-	//	}
-	//}
+	if targetPod == nil {
+		return
+	}
+
+	targetPod.ReapProcess(container, processId)
+	// Reap the pod if it's become reapable
+	if targetPod.ShouldReap() {
+		targetPod.reap()
+		sv.pods = append(sv.pods[:podIdx], sv.pods[podIdx+1:]...)
+
+	}
 }
 
 // find shared pod or create a new one
@@ -247,11 +252,14 @@ func (sv *Supervisor) getHyperPod(container string, spec *specs.Spec) (*HyperPod
 			}
 		}
 	}
+
+	// TODO: prevent containerIds being able to race while starting up a pod.
+
 	// If no pod found by now, create a new pod
 	if hp == nil {
 		var err error
-		glog.V(3).Infof("createHyperPod() entered")
-		hp, err = createHyperPod(
+		glog.V(3).Infof("CreateHyperPod() entered")
+		hp, err = CreateHyperPod(
 			sv.Factory,
 			spec,
 			sv.defaultCpus,
@@ -259,19 +267,10 @@ func (sv *Supervisor) getHyperPod(container string, spec *specs.Spec) (*HyperPod
 			sv.StateDir,
 			sv.Events.notifySubscribers,
 		)
-		glog.Infof("createHyperPod() returns")
+		glog.Infof("CreateHyperPod() returns")
 
 		if err != nil {
 			return nil, err
-		}
-
-		// There's no lock while starting up a pod, so it's possible a
-		// container with a matching ID was created elsewhere while we were
-		// starting up.
-		if c := sv.getContainer(container); c != nil {
-			if _, ok := sv.containers[container]; ok {
-				go hp.reap()
-			}
 		}
 	}
 

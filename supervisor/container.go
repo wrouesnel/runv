@@ -19,7 +19,6 @@ import (
 	"github.com/hyperhq/runv/lib/utils"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"sync"
-	"syscall"
 )
 
 const (
@@ -47,7 +46,11 @@ type Container struct {
 	// notifyFn is a creator-provided function to dispatch container events
 	notifyFn func(e Event)
 
-	// Protects Container.Processes
+	// flag channel if container is shutting down/has shutdown. channel is
+	// closed when it is true.
+	reaping chan bool
+
+	// Protects Container.Processes, Container.reap
 	sync.RWMutex
 }
 
@@ -62,6 +65,7 @@ func NewContainer(containerId, bundlePath, stdin, stdout, stderr string, spec *s
 		processes:   make(map[string]*Process),
 		stateDir:    stateDir,
 		notifyFn:    notifyFn,
+		reaping:     make(chan bool),
 	}
 	// Create the init process
 	innerProcessId := containerId + "-init"
@@ -75,6 +79,7 @@ func NewContainer(containerId, bundlePath, stdin, stdout, stderr string, spec *s
 
 		innerId: innerProcessId,
 		init:    true,
+		reaping: make(chan bool),
 	}
 	// Setup the init process.
 	if err := p.setupIO(); err != nil {
@@ -96,24 +101,39 @@ func (c *Container) notify(e Event) {
 	}
 }
 
-func (c *Container) countProcesses() int {
-	c.RLock()
-	defer c.RUnlock()
-
-	return len(c.processes)
-}
-
 // getProcess locks and retrieves a process struct from the given container.
 // It *does not* guarantee that the process will not be subsequently removed
 // from the container.
 func (c *Container) getProcess(processId string) *Process {
 	c.RLock()
 	defer c.RUnlock()
+	// If the container is being reaped, there can be no processes.
+	if c.ShouldReap() {
+		return nil
+	}
 
 	if p, ok := c.processes[processId]; ok {
 		return p
 	}
 	return nil
+}
+
+// ListProcesses returns a list of all processes in this container.
+func (c *Container) ListProcesses() []*Process {
+	c.RLock()
+	defer c.RUnlock()
+
+	returnedList := []*Process{}
+
+	if c.ShouldReap() {
+		return returnedList
+	}
+
+	for _, p := range c.processes {
+		returnedList = append(returnedList, p)
+	}
+
+	return returnedList
 }
 
 // run launches this container. It is non-blocking once the
@@ -167,7 +187,7 @@ func (c *Container) run() error {
 		}
 		c.notify(e)
 		// Reap the finished init process.
-		c.reapProcess(ContainerInitProcessId)
+		c.ReapProcess(ContainerInitProcessId)
 	}()
 
 	return nil
@@ -299,14 +319,17 @@ func (c *Container) wait(p *Process, result <-chan *api.ProcessExit) (*api.Proce
 	return exit, nil
 }
 
-// addProcess adds a process to the current container. It is called by
-// HyperPod.addProcess, which validates processId uniqueness at the pod-level.
-func (c *Container) addProcess(processId, stdin, stdout, stderr string, spec *specs.Process) (*Process, error) {
+// AddProcess adds a process to the current container. It is called by
+// HyperPod.AddProcess, which validates processId uniqueness at the pod-level.
+func (c *Container) AddProcess(processId, stdin, stdout, stderr string, spec *specs.Process) (*Process, error) {
 	// Lock the container while doing a processID check - if failed, we
 	// unlock, but if success we need to ensure no other process with that ID
 	// is created before we finish.
 	c.Lock()
 	defer c.Unlock()
+	if c.ShouldReap() {
+		return nil, fmt.Errorf("init process of the container %s had already exited", c.Id)
+	}
 
 	if _, ok := c.processes[processId]; ok {
 		return nil, fmt.Errorf("conflict process ID (%s)", processId)
@@ -373,7 +396,7 @@ func (c *Container) addProcess(processId, stdin, stdout, stderr string, spec *sp
 		// Notify event watchers of exit
 		c.notify(e)
 		// Reap the process
-		c.reapProcess(processId)
+		c.ReapProcess(processId)
 	}()
 	return p, nil
 }
@@ -428,23 +451,19 @@ func execPoststopHooks(rt *specs.Spec, state *specs.State) error {
 // Signal forwards a signal to a process in this container
 func (c *Container) Signal(processId string, sig int) error {
 	p := c.getProcess(processId)
-	if p.init {
-		// TODO: change vm.KillContainer()
-		return c.vm.KillContainer(c.Id, syscall.Signal(sig))
+	if p == nil {
+		return fmt.Errorf("reapProcess: container %s does not have a process %s", c.Id, processId)
 	}
 	return p.Signal(sig)
 }
 
 // reapProcess reaps a given process from the container
-func (c *Container) reapProcess(process string) error {
-	// Critical section: ensure no one can acquire the process from the container
-	// while we reap it and delete it
-	c.Lock()
-	defer c.Unlock()
-	p, found := c.processes[process]
-	if !found {
+func (c *Container) ReapProcess(process string) error {
+	p := c.getProcess(process)
+	if p == nil {
 		return fmt.Errorf("reapProcess: container %s does not have a process %s", c.Id, process)
 	}
+
 	go p.reap()
 	delete(c.processes, process)
 
@@ -452,19 +471,31 @@ func (c *Container) reapProcess(process string) error {
 	// Note: depends on support for killing non-init processes in containers in
 	// Process
 	if p.init {
-		// TODO: support killing processes
-		//glog.V(1).Infof("Container (%s) init killed. Killing remaining container processes.")
-		//for pid, p := range c.processes {
-		//	glog.V(3).Infof("Container (%s): init killed - reaping process %s", c.Id, pid)
-		//	go p.reap()
-		//	delete(c.processes, pid)
-		//}
+		// TODO: need support for killing container processes.
+	}
+
+	// If no more processes, mark the container as reapable.
+	if len(c.processes) == 0 {
+		close(c.reaping)
+		go c.reap()
 	}
 
 	return nil
 }
 
+// Returns true if the container has reaped/is about to be reaped.
+// Returns false is the container is healthy.
+func (c *Container) ShouldReap() bool {
+	select {
+	case <-c.reaping:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *Container) reap() {
+	// Run these operations asynchronously to not block clean up.
 	containerSharedDir := filepath.Join(hypervisor.BaseDir, c.vm.Id, hypervisor.ShareDirTag, c.Id)
 	utils.Umount(filepath.Join(containerSharedDir, "rootfs"))
 	os.RemoveAll(containerSharedDir)

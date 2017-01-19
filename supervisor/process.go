@@ -6,11 +6,10 @@ import (
 	"os"
 	"syscall"
 
-	"github.com/constabulary/gb/testdata/src/c"
-	"github.com/go-swagger/go-swagger/spec"
 	"github.com/golang/glog"
 	"github.com/hyperhq/runv/hypervisor"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"sync"
 )
 
 type Process struct {
@@ -34,6 +33,12 @@ type Process struct {
 	init        bool
 	stdio       *hypervisor.TtyIO
 	stdinCloser io.Closer
+
+	// flag channel if container is shutting down/has shutdown. channel is
+	// closed when it is true.
+	reaping chan bool
+
+	sync.RWMutex
 }
 
 func (p *Process) setupIO() error {
@@ -69,7 +74,14 @@ func (p *Process) setupIO() error {
 	return nil
 }
 
-func (p *Process) ttyResize(container string, width, height int) error {
+// TtyResize requests the process resize it's TTY.
+func (p *Process) TtyResize(container string, width, height int) error {
+	p.Lock()
+	p.Unlock()
+	if p.ShouldReap() {
+		return fmt.Errorf("Process (%s) has already exited.", p.Id)
+	}
+
 	// If working on the primary process, do not pass execId (it won't be recognized)
 	if p.innerId == fmt.Sprintf("%s-init", container) {
 		return p.vm.Tty(container, "", height, width)
@@ -87,10 +99,27 @@ func (p *Process) closeStdin() error {
 }
 
 func (p *Process) Signal(sig int) error {
+	// TODO: support killing non-init in the VM
+	if p.init {
+		// TODO: change vm.KillContainer()
+		return p.vm.KillContainer(p.Id, syscall.Signal(sig))
+	}
 	return fmt.Errorf("Kill to non-init process of container is unsupported")
 }
 
+func (p *Process) ShouldReap() bool {
+	select {
+	case <-p.reaping:
+		return true
+	default:
+		return false
+	}
+}
+
 func (p *Process) reap() {
+	p.Lock()
+	p.Unlock()
+	close(p.reaping)
+
 	p.closeStdin()
-	// TODO: support killing non-init in the VM
 }

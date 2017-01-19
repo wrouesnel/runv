@@ -116,15 +116,15 @@ func (s *apiServer) State(ctx context.Context, r *types.StateRequest) (*types.St
 			Memory: uint64(mem.Total / 1024 / 1024),
 		},
 	}
-	s.sv.RLock()
-	for _, c := range s.sv.Containers {
+
+	for _, c := range s.sv.ListContainers() {
 		apiC := supervisorContainer2ApiContainer(c)
-		for _, p := range c.Processes {
+		for _, p := range c.ListProcesses() {
 			addApiProcess2ApiContainer(apiC, supervisorProcess2ApiProcess(p))
 		}
 		state.Containers = append(state.Containers, apiC)
 	}
-	s.sv.RUnlock()
+
 	return state, nil
 }
 
